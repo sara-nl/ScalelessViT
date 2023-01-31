@@ -49,10 +49,15 @@ class ResNet18(nn.Module):
 
 
 class ScalelessViT(nn.Module):
-    def __init__(self, n_classes=3, input_dims=(64, 64), latent_size=32, transformer_history_size=8):
+    def __init__(self, n_classes=3, input_dims=(64, 64), latent_size=32, transformer_history_size=8,
+                 n_heads=8):
         super().__init__()
 
         self.input_dims = input_dims
+        self.transformer_history_size = transformer_history_size
+        self.latent_size = latent_size
+
+        # Assume pretrained
         self.image_model = nn.Sequential(
             ResNet18(),
             nn.Flatten(),
@@ -61,9 +66,9 @@ class ScalelessViT(nn.Module):
 
         self.transformer_model = Transformer(
             dim=latent_size, depth=4, heads=transformer_history_size,
-            dim_head=latent_size, mlp_dim=latent_size)
+            dim_head=n_heads, mlp_dim=latent_size)
 
-        transformer_latent_size = latent_size
+        transformer_latent_size = latent_size * transformer_history_size
         self.classifier_head = nn.Sequential(
             nn.Linear(transformer_latent_size, n_classes),
         )
@@ -80,21 +85,45 @@ class ScalelessViT(nn.Module):
         Pass input, scales, and previous image_model latents.
         Scale is defined as [offset_x, offset_y, scale_x, scale_y]
 
-        :param x: Batch of images of any size [b, c, x, y]
+        :param x: Batch of images of any size [b, c, w, h]
         :param transformation: Batch of scales for each image [b, 4]
         :param history: List of previous transformer latents, the list will get 1 new entry
         :return:
         """
-        # Create
+        b, c, w, h = x.shape
+
+        # Create image patch from transformation
         images = self._extract_images_with_scales(x, transformation)
 
+        # Assume a pretrained image model exists.
         image_latent = self.image_model(images)
 
-        # Create a stacked latent history tensor
+        # Store latents to use for future iterations
+        # History is in format: N, B, D
+        # Reformat to B, N, D before using
         history.append(image_latent.detach())
-        transformer_input = torch.stack(history, dim=1)
 
-        transformer_latent = self.transformer_model(transformer_input)
+        transformer_input = torch.zeros((b, self.transformer_history_size, self.latent_size))
+
+        # We will only train the transformer model, so creating the input starts here
+        # The history array is of shape [n, b, l]
+        # N is the nth iteration, b is the batch size, and l is the latent size.
+        inp = torch.stack(history, dim=1)
+        transformer_input[:, :inp.shape[1], :] = inp
+
+        # TODO: Shuffle data correctly
+        # torch.swapaxes(transformer_input, 1, 2)
+        # torch.reshape(transformer_input, (b, self.transformer_history_size, self.latent_size))
+
+        print("\n\n", transformer_input.shape)
+
+        transformer_latent = (
+            self
+            .transformer_model(transformer_input)
+            .reshape(b, self.transformer_history_size * self.latent_size)
+        )
+
+        print(transformer_latent.shape)
 
         class_pred = self.classifier_head(transformer_latent)
         transform_pred = self.transformation_head(transformer_latent)
@@ -104,7 +133,7 @@ class ScalelessViT(nn.Module):
     def _extract_images_with_scales(self, x, scales):
         sampled_images = []
         for image, scale in zip(x, scales):
-            # Extract percentage x,y and zoom x,z
+            # Extract percentage x,y and zoom x,y
             px, py = scale[:2]
             zx, zy = scale[2:]
 
@@ -126,6 +155,6 @@ class ScalelessViT(nn.Module):
             sampled_images.append(torch.nn.functional.interpolate(
                 image.unsqueeze(0)[:, :, x1:x1 + x_size, y1:y1 + y_size],
                 self.input_dims, mode="nearest"
-            ))
+            ).squeeze(0))
 
         return torch.stack(sampled_images)
