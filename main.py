@@ -8,21 +8,22 @@ from torch.utils import data
 
 
 def train(model, train_dataloader, calibration_iters):
-    optimizer = torch.optim.Adam(lr=0.01, params=model.parameters())
+    optimizer = torch.optim.Adam(lr=2e-6, params=model.parameters())
 
     bar = tqdm(train_dataloader)
     for x, targets in bar:
         targets = targets.to(model.device)
         x = x.to(model.device)
+        bs = targets.shape[0]
 
         optimizer.zero_grad()
 
         # History for this batch
-        history = []
+        history = model.get_initial_history(batch_size=bs)
 
         # Store previous iteration classification to compute loss on network scale_output
-        previous_classes = torch.ones((targets.shape[0], model.n_classes), device=model.device) / model.n_classes
-        transformation = model.get_initial_transform(targets.shape[0])
+        previous_classes = torch.ones((bs, model.n_classes), device=model.device) / model.n_classes
+        transformation = model.get_initial_transform(bs)
         start_loss = 0
         end_loss = 0
         for i in range(calibration_iters):
@@ -46,18 +47,22 @@ def train(model, train_dataloader, calibration_iters):
 def test(model, test_dataloader, calibration_iters):
     losses = []
     accs = []
+    losses_1s = []
+    accs_1s = []
+
     bar = tqdm(test_dataloader)
     model.eval()
     for x, targets in bar:
         x = x.to(model.device)
         targets = targets.to(model.device)
+        bs = targets.shape[0]
 
         # History for this batch
-        history = []
+        history = model.get_initial_history(bs)
 
         # Store previous iteration classification to compute loss on network scale_output
-        previous_classes = torch.ones((targets.shape[0], model.n_classes), device=model.device) / model.n_classes
-        transformation = model.get_initial_transform(targets.shape[0])
+        previous_classes = torch.ones((bs, model.n_classes), device=model.device) / model.n_classes
+        transformation = model.get_initial_transform(bs)
         for i in range(calibration_iters):
             classification, transformation = model(x, transformation, history)
 
@@ -66,17 +71,21 @@ def test(model, test_dataloader, calibration_iters):
             # Store previous classes to get loss next iteration
             previous_classes = classification
 
+            if i == 0:
+                accs_1s.append(torch.mean((torch.argmax(previous_classes, dim=1) == targets).float()))
+                losses_1s.append(loss.item())
+
             losses.append(loss.item())
         accs.append(torch.mean((torch.argmax(previous_classes, dim=1) == targets).float()))
     model.train()
-    print(f"Val loss: {sum(losses) / len(losses)}")
-    print(f"Val acc:", {sum(accs) / len(accs)})
+    print(f"Val loss: {sum(losses) / len(losses)} (1-shot: {sum(losses_1s) / len(losses_1s)})")
+    print(f"Val acc: {sum(accs) / len(accs)} (1-shot: {sum(accs_1s) / len(accs_1s)}")
 
 
 def main():
     device = "cuda:0"
     batch_size = 64
-    n_epochs = 2
+    n_epochs = 10
     calibration_iters = 8  # How many subsections of the image will we look at
 
     model = ScalelessViT(n_classes=10, input_dims=(8, 8), transformer_history_size=calibration_iters, device=device)

@@ -1,3 +1,6 @@
+import itertools
+
+import numpy as np
 import torch
 from torch import nn
 from layers.transformer import Transformer
@@ -86,10 +89,14 @@ class ScalelessViT(nn.Module):
         # Initial transformation is 0, 0 (start in left upper corner) and 1, 1 (use the entire image size)
         return torch.stack([torch.IntTensor([0, 0, 1, 1]) for i in range(batch_size)])
 
+    def get_initial_history(self, batch_size):
+        return [torch.zeros((batch_size, self.latent_size), device=self.device, requires_grad=True) for _ in
+                range(self.transformer_history_size)]
+
     def compute_loss(self, classification, previous_classes, targets):
         # Calculate loss on the classification
-        cl_weight = 1  # Class loss weight
-        sl_weight = 0.2  # Scale loss weight, use to balance loss combination
+        cl_weight = 0.5  # Class loss weight
+        sl_weight = 0.5  # Scale loss weight, use to balance loss combination
         class_loss = self.loss(classification, targets) * cl_weight
 
         # Scale loss subtracts previous prediction from current.
@@ -124,23 +131,18 @@ class ScalelessViT(nn.Module):
         # Store latents to use for future iterations
         # History is in format: N, B, D
         # Reformat to B, N, D before using
-        history.append(image_latent.detach())
-
-        transformer_input = torch.zeros((b, self.transformer_history_size, self.latent_size),
-                                        device=self.device,
-                                        requires_grad=True)
+        history.append(image_latent)
 
         # We will only train the transformer model, so creating the input starts here
         # The history array is of shape [n, b, l]
         # N is the nth iteration, b is the batch size, and l is the latent size.
-        inp = torch.stack(history, dim=1)
-        transformer_input[:, :inp.shape[1], :] = inp
+
+        # Take the last N samples from history to build transformer input
+        transformer_input = torch.stack(history[-self.transformer_history_size:], dim=1)
 
         # TODO: Shuffle data correctly
         # torch.swapaxes(transformer_input, 1, 2)
         # torch.reshape(transformer_input, (b, self.transformer_history_size, self.latent_size))
-
-        print("\n\n\n", transformer_input.requires_grad)
 
         transformer_latent = (
             self.transformer_model(transformer_input).reshape(b, self.transformer_history_size * self.latent_size)
@@ -155,10 +157,8 @@ class ScalelessViT(nn.Module):
         sampled_images = []
         for image, scale in zip(x, scales):
             # Extract percentage x,y and zoom x,y
-            px, py = scale[:2]
-            zx, zy = scale[2:]
-
-            w, h = image.shape[1:]  # Ignore channel
+            px, py, zx, zy = scale.detach().cpu().numpy()
+            c, w, h = image.shape
 
             # Get the selected box starting point as subset of the image.
             # We now scale the   0,1   range to    0,(size-64)  so we cannot have invalid percentages.
@@ -173,9 +173,20 @@ class ScalelessViT(nn.Module):
             x_size = min(w - x1, x_size)
             y_size = min(h - y1, y_size)
 
-            sampled_images.append(torch.nn.functional.interpolate(
-                image.unsqueeze(0)[:, :, int(x1):int(x1 + x_size), int(y1):int(y1 + y_size)],
-                self.input_dims, mode="nearest"
-            ).squeeze(0))
+            do_itertools = True
+
+            if do_itertools:
+                # Scale step to valid values for numpy array
+                x_interval = (np.arange(0, self.input_dims[0]) / self.input_dims[0] * x_size).astype(int) + x1
+                y_interval = (np.arange(0, self.input_dims[1]) / self.input_dims[1] * y_size).astype(int) + y1
+
+                # Make combination indices and extract sub-image
+                indices = itertools.product(np.arange(0, c), x_interval, y_interval)
+                sampled_images.append(image[tuple(np.transpose(list(indices)))])
+            else:
+                sampled_images.append(torch.nn.functional.interpolate(
+                    image.unsqueeze(0)[:, :, int(x1):int(x1 + x_size), int(y1):int(y1 + y_size)],
+                    self.input_dims, mode="nearest"
+                ).squeeze(0))
 
         return torch.stack(sampled_images).to(self.device)
