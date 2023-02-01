@@ -1,53 +1,111 @@
 from typing import List
 import torch
+from tqdm import tqdm
 
 from model import ScalelessViT
+import torchvision.datasets.mnist
+from torch.utils import data
 
 
-def main():
-    batch_size = 1
-    model = ScalelessViT(n_classes=3)
+def train(model, train_dataloader, calibration_iters):
+    optimizer = torch.optim.Adam(lr=0.01, params=model.parameters())
 
-    calibration_iters = 10  # How many subsections of the image will we look at
+    bar = tqdm(train_dataloader)
+    for x, targets in bar:
+        targets = targets.to(model.device)
+        x = x.to(model.device)
 
-    dataset: List[torch.Tensor] = [
-        (torch.rand((1, 1, 412, 122)), torch.ones((1, 1), dtype=int)),
-        (torch.rand((1, 1, 1514, 321)), torch.ones((1, 1), dtype=int)),
-    ]
+        optimizer.zero_grad()
 
-    # Initial transformation is 0, 0 (start in left upper corner) and 1, 1 (use the entire image size)
-    initial_transformation = torch.stack([torch.IntTensor([0, 0, 1, 1]) for i in range(batch_size)])
+        # History for this batch
+        history = []
 
-    history = []
-    for x, targets in dataset:
         # Store previous iteration classification to compute loss on network scale_output
-        previous_classes = []
-        transformation = initial_transformation
+        previous_classes = torch.ones((targets.shape[0], model.n_classes), device=model.device) / model.n_classes
+        transformation = model.get_initial_transform(targets.shape[0])
+        start_loss = 0
+        end_loss = 0
         for i in range(calibration_iters):
-            print(x.shape, transformation.shape, len(history))
             classification, transformation = model(x, transformation, history)
 
-            print(classification.shape, transformation.shape)
-            print(classification, transformation)
-
-            # Calculate loss on the classification
-            cl_weight = 1  # Class loss weight
-            sl_weight = 0.2  # Scale loss weight, use to balance loss combination
-            class_loss = model.loss(classification, targets) * cl_weight
-
-            # Scale loss subtracts previous prediction from current.
-            # If previous prediction on target class was better, it should have higher loss
-            # If current prediction is better, loss should be lower
-            scale_loss = model.loss(classification - previous_classes, targets) * sl_weight
-
-            # Handle loss (maybe aggregate this over all subsegments)
-            loss = class_loss + scale_loss
-            print(loss)
-            # loss.backward()
+            loss = model.compute_loss(classification, previous_classes, targets=targets)
+            loss.backward(retain_graph=True)
 
             # Store previous classes to get loss next iteration
             previous_classes = classification
-            exit(0)
+
+            # Report loss improvement over refinement iterations
+            if i == 0:
+                start_loss = loss.item()
+            end_loss = loss.item()
+            bar.set_postfix_str(f"Loss: {round(start_loss, 2)} -> {round(end_loss, 2)}")
+
+        optimizer.step()
+
+
+def test(model, test_dataloader, calibration_iters):
+    losses = []
+    accs = []
+    bar = tqdm(test_dataloader)
+    model.eval()
+    for x, targets in bar:
+        x = x.to(model.device)
+        targets = targets.to(model.device)
+
+        # History for this batch
+        history = []
+
+        # Store previous iteration classification to compute loss on network scale_output
+        previous_classes = torch.ones((targets.shape[0], model.n_classes), device=model.device) / model.n_classes
+        transformation = model.get_initial_transform(targets.shape[0])
+        for i in range(calibration_iters):
+            classification, transformation = model(x, transformation, history)
+
+            loss = model.compute_loss(classification, previous_classes, targets=targets)
+
+            # Store previous classes to get loss next iteration
+            previous_classes = classification
+
+            losses.append(loss.item())
+        accs.append(torch.mean((torch.argmax(previous_classes, dim=1) == targets).float()))
+    model.train()
+    print(f"Val loss: {sum(losses) / len(losses)}")
+    print(f"Val acc:", {sum(accs) / len(accs)})
+
+
+def main():
+    device = "cuda:0"
+    batch_size = 64
+    n_epochs = 2
+    calibration_iters = 8  # How many subsections of the image will we look at
+
+    model = ScalelessViT(n_classes=10, input_dims=(8, 8), transformer_history_size=calibration_iters, device=device)
+
+    dataset = torchvision.datasets.mnist.MNIST(
+        root="datasets/",
+        download=True,
+        transform=torchvision.transforms.ToTensor(),
+    )
+
+    # Load data and model to device
+    model = model.to(device)
+    dataset.data.to(device)
+    dataset.targets.to(device)
+
+    # Split dataset
+    tr = int(len(dataset) * 0.7)
+    te = len(dataset) - tr
+    train_dataset, test_dataset = data.random_split(dataset, lengths=(tr, te))
+
+    # Create dataloaders
+    test_dataloader = data.dataloader.DataLoader(test_dataset, batch_size=1024)
+    train_dataloader = data.dataloader.DataLoader(train_dataset, batch_size=batch_size)
+
+    for epoch in range(n_epochs):
+        print(f"Epoch {epoch}")
+
+        train(model, train_dataloader, calibration_iters)
+        test(model, test_dataloader, calibration_iters)
 
 
 if __name__ == "__main__":

@@ -50,9 +50,11 @@ class ResNet18(nn.Module):
 
 class ScalelessViT(nn.Module):
     def __init__(self, n_classes=3, input_dims=(64, 64), latent_size=32, transformer_history_size=8,
-                 n_heads=8):
+                 n_heads=8, device="cpu"):
         super().__init__()
 
+        self.device = device
+        self.n_classes = n_classes
         self.input_dims = input_dims
         self.transformer_history_size = transformer_history_size
         self.latent_size = latent_size
@@ -61,7 +63,7 @@ class ScalelessViT(nn.Module):
         self.image_model = nn.Sequential(
             ResNet18(),
             nn.Flatten(),
-            nn.Linear(64 * 64, latent_size)
+            nn.Linear(input_dims[0] * input_dims[1], latent_size)
         )
 
         self.transformer_model = Transformer(
@@ -78,6 +80,27 @@ class ScalelessViT(nn.Module):
         )
 
         self.loss = nn.CrossEntropyLoss()
+
+    @staticmethod
+    def get_initial_transform(batch_size):
+        # Initial transformation is 0, 0 (start in left upper corner) and 1, 1 (use the entire image size)
+        return torch.stack([torch.IntTensor([0, 0, 1, 1]) for i in range(batch_size)])
+
+    def compute_loss(self, classification, previous_classes, targets):
+        # Calculate loss on the classification
+        cl_weight = 1  # Class loss weight
+        sl_weight = 0.2  # Scale loss weight, use to balance loss combination
+        class_loss = self.loss(classification, targets) * cl_weight
+
+        # Scale loss subtracts previous prediction from current.
+        # If previous prediction on target class was better, it should have higher loss
+        # If current prediction is better, loss should be lower
+        scale_loss = self.loss(classification - previous_classes, targets) * sl_weight
+
+        # Handle loss (maybe aggregate this over all subsegments)
+        loss = class_loss + scale_loss
+
+        return loss
 
     def forward(self, x, transformation, history):
         """
@@ -103,7 +126,9 @@ class ScalelessViT(nn.Module):
         # Reformat to B, N, D before using
         history.append(image_latent.detach())
 
-        transformer_input = torch.zeros((b, self.transformer_history_size, self.latent_size))
+        transformer_input = torch.zeros((b, self.transformer_history_size, self.latent_size),
+                                        device=self.device,
+                                        requires_grad=True)
 
         # We will only train the transformer model, so creating the input starts here
         # The history array is of shape [n, b, l]
@@ -115,15 +140,11 @@ class ScalelessViT(nn.Module):
         # torch.swapaxes(transformer_input, 1, 2)
         # torch.reshape(transformer_input, (b, self.transformer_history_size, self.latent_size))
 
-        print("\n\n", transformer_input.shape)
+        print("\n\n\n", transformer_input.requires_grad)
 
         transformer_latent = (
-            self
-            .transformer_model(transformer_input)
-            .reshape(b, self.transformer_history_size * self.latent_size)
+            self.transformer_model(transformer_input).reshape(b, self.transformer_history_size * self.latent_size)
         )
-
-        print(transformer_latent.shape)
 
         class_pred = self.classifier_head(transformer_latent)
         transform_pred = self.transformation_head(transformer_latent)
@@ -153,8 +174,8 @@ class ScalelessViT(nn.Module):
             y_size = min(h - y1, y_size)
 
             sampled_images.append(torch.nn.functional.interpolate(
-                image.unsqueeze(0)[:, :, x1:x1 + x_size, y1:y1 + y_size],
+                image.unsqueeze(0)[:, :, int(x1):int(x1 + x_size), int(y1):int(y1 + y_size)],
                 self.input_dims, mode="nearest"
             ).squeeze(0))
 
-        return torch.stack(sampled_images)
+        return torch.stack(sampled_images).to(self.device)
