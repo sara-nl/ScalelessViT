@@ -1,9 +1,10 @@
-import itertools
+from typing import Tuple
 
-import numpy as np
 import torch
+import torchvision.transforms.functional_tensor
 from torch import nn
 from layers.transformer import Transformer
+import cProfile
 
 
 class ResidualBlock(nn.Module):
@@ -58,7 +59,7 @@ class ScalelessViT(nn.Module):
 
         self.device = device
         self.n_classes = n_classes
-        self.input_dims = input_dims
+        self.input_dims: torch.IntTensor = torch.IntTensor(input_dims)
         self.transformer_history_size = transformer_history_size
         self.latent_size = latent_size
 
@@ -82,6 +83,8 @@ class ScalelessViT(nn.Module):
             nn.Sigmoid()
         )
 
+        self.profiler = cProfile.Profile()
+
         self.loss = nn.CrossEntropyLoss()
 
     @staticmethod
@@ -102,6 +105,10 @@ class ScalelessViT(nn.Module):
         # Scale loss subtracts previous prediction from current.
         # If previous prediction on target class was better, it should have higher loss
         # If current prediction is better, loss should be lower
+        # norms = torch.nn.functional.normalize(classification) - torch.nn.functional.normalize(previous_classes)
+        # norms -= torch.min(norms, dim=1)[0][:, None]
+        #
+        # norms = norms / norms.sum(dim=1)[:, None]
         scale_loss = self.loss(classification - previous_classes, targets) * sl_weight
 
         # Handle loss (maybe aggregate this over all subsegments)
@@ -109,7 +116,7 @@ class ScalelessViT(nn.Module):
 
         return loss
 
-    def forward(self, x, transformation, history):
+    def forward(self, x, history):
         """
         x should be a list of image tensors, the images need not be the same shapes.
         Pass input, scales, and previous image_model latents.
@@ -118,15 +125,13 @@ class ScalelessViT(nn.Module):
         :param x: Batch of images of any size [b, c, w, h]
         :param transformation: Batch of scales for each image [b, 4]
         :param history: List of previous transformer latents, the list will get 1 new entry
+        :param return_image:
         :return:
         """
         b, c, w, h = x.shape
 
-        # Create image patch from transformation
-        images = self._extract_images_with_scales(x, transformation)
-
         # Assume a pretrained image model exists.
-        image_latent = self.image_model(images)
+        image_latent = self.image_model(x)
 
         # Store latents to use for future iterations
         # History is in format: N, B, D
@@ -141,8 +146,8 @@ class ScalelessViT(nn.Module):
         transformer_input = torch.stack(history[-self.transformer_history_size:], dim=1)
 
         # TODO: Shuffle data correctly
-        # torch.swapaxes(transformer_input, 1, 2)
-        # torch.reshape(transformer_input, (b, self.transformer_history_size, self.latent_size))
+        transformer_input = torch.reshape(transformer_input.permute((0, 2, 1)),
+                                          (b, self.transformer_history_size, self.latent_size))
 
         transformer_latent = (
             self.transformer_model(transformer_input).reshape(b, self.transformer_history_size * self.latent_size)
@@ -153,40 +158,38 @@ class ScalelessViT(nn.Module):
 
         return class_pred, transform_pred
 
-    def _extract_images_with_scales(self, x, scales):
+    @staticmethod
+    def extract_images_with_scales(x: torch.IntTensor, scales: torch.IntTensor,
+                                   dims: torch.IntTensor) -> torch.Tensor:
         sampled_images = []
-        for image, scale in zip(x, scales):
+        for i in range(len(x)):
+            scale = scales[i]
+            image = x[i]
+
             # Extract percentage x,y and zoom x,y
-            px, py, zx, zy = scale.detach().cpu().numpy()
+            px, py, zx, zy = [scale[n].item() for n in range(4)]
             c, w, h = image.shape
+
+            avx = (w - dims[0])  # Available space X
+            avy = (h - dims[1])  # Available space Y
 
             # Get the selected box starting point as subset of the image.
             # We now scale the   0,1   range to    0,(size-64)  so we cannot have invalid percentages.
-            x1 = px * (w - self.input_dims[0])
-            y1 = py * (h - self.input_dims[1])
+            x1 = px * avx
+            y1 = py * avy
 
             # We scale the image to be 64 for zoom=0, and image_size for zoom=1
-            x_size = (zx * (w - self.input_dims[0])) + self.input_dims[0]
-            y_size = (zy * (h - self.input_dims[1])) + self.input_dims[1]
-
             # Clip max size based on available remaining pixels
-            x_size = min(w - x1, x_size)
-            y_size = min(h - y1, y_size)
+            x_size = min(w - x1, (zx * avx) + dims[0])
+            y_size = min(h - y1, (zy * avy) + dims[1])
 
-            do_itertools = True
+            cropped = torchvision.transforms.functional_tensor.crop(
+                image, int(x1), int(y1), int(x_size), int(y_size)
+            ).unsqueeze(0)
+            interpolated = torch.nn.functional.interpolate(
+                cropped,
+                dims[0].item(), mode="nearest"
+            ).squeeze(0)
+            sampled_images.append(interpolated)
 
-            if do_itertools:
-                # Scale step to valid values for numpy array
-                x_interval = (np.arange(0, self.input_dims[0]) / self.input_dims[0] * x_size).astype(int) + x1
-                y_interval = (np.arange(0, self.input_dims[1]) / self.input_dims[1] * y_size).astype(int) + y1
-
-                # Make combination indices and extract sub-image
-                indices = itertools.product(np.arange(0, c), x_interval, y_interval)
-                sampled_images.append(image[tuple(np.transpose(list(indices)))])
-            else:
-                sampled_images.append(torch.nn.functional.interpolate(
-                    image.unsqueeze(0)[:, :, int(x1):int(x1 + x_size), int(y1):int(y1 + y_size)],
-                    self.input_dims, mode="nearest"
-                ).squeeze(0))
-
-        return torch.stack(sampled_images).to(self.device)
+        return torch.stack(sampled_images)
