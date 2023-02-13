@@ -1,9 +1,8 @@
 #include <vector>
 #include <cstdio>
 #include <torch/extension.h>
-#include "omp.h"
 #include <ATen/ATen.h>
-#include <cuda.h>
+#include "kernels.cuh"
 
 torch::Tensor generate_dummy_images(int B, int C, torch::Device dev) {
     int W = 28, H = 28;
@@ -13,7 +12,7 @@ torch::Tensor generate_dummy_images(int B, int C, torch::Device dev) {
 }
 
 torch::Tensor generate_dummy_transforms(int B, torch::Device dev) {
-    auto options = torch::TensorOptions().dtype(torch::kFloat16).device(dev);
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(dev);
     return torch::rand({B, 4}, options);
 }
 
@@ -156,7 +155,7 @@ torch::Tensor crop_interpolate_parallel(
                     int sy = int(y1 + (y_size / float(cH)) * float(y));
 
                     for (long c = 0; c < channels; c++) {
-                        cropped_images[i][0][x][y] = image[0][sx][sy];
+                        cropped_images[i][c][x][y] = image[c][sx][sy];
                     }
                 }
             }
@@ -168,20 +167,22 @@ torch::Tensor crop_interpolate_parallel(
 
 
 int main() {
-    int B = 64  ;
+    int B = 64;
     int C = 1;
     torch::DimVector dims = {8, 8};
 
     int n_devices = 2;
-    int n_functions = 3;
+    int n_functions = 4;
 
-    for (uint i = 0; i < (n_devices * n_functions); i++) {
+    initialize();
+
+    for (uint i = 7; i < (n_devices * n_functions); i++) {
         torch::Device device = torch::Device(torch::kCPU);;
-        uint dev = i / n_functions;
+        uint dev = i % n_devices;
         if (dev == 0) {
             device = torch::Device(torch::kCPU);
         } else {
-            device = torch::Device(torch::kCUDA, 1);
+            device = torch::Device(torch::kCUDA, 0);
         }
 
 
@@ -189,21 +190,23 @@ int main() {
         torch::Tensor images = generate_dummy_images(B, C, device);
         torch::Tensor transforms = generate_dummy_transforms(B, device);
 
-        using milli = std::chrono::milliseconds;
+        using nano = std::chrono::nanoseconds;
         auto start = std::chrono::high_resolution_clock::now();
 
-        uint func = i % n_functions;
+        uint func = i / n_devices;
         if (func == 0) {
             auto result = crop_interpolate_tensor(images, transforms, dims);
         } else if (func == 1) {
             auto result = crop_interpolate_default(images, transforms, dims);
-        }else if (func == 2) {
+        } else if (func == 2) {
             auto result = crop_interpolate_parallel(images, transforms, dims);
+        } else if (func == 3) {
+            auto result = call_ci_kernel(images, transforms, dims);
         }
 
         auto finish = std::chrono::high_resolution_clock::now();
         std::cout << "ci" << func << " (" << device << ") took "
-                  << std::chrono::duration_cast<milli>(finish - start).count()
+                  << std::chrono::duration_cast<nano>(finish - start).count() / 1.e6
                   << " ms\n";
     }
 

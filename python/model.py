@@ -1,9 +1,9 @@
+from functools import cache
 from typing import Tuple
 
 import torch
 import torchvision.transforms.functional_tensor
 from torch import nn
-from layers.transformer import Transformer
 import cProfile
 
 
@@ -39,13 +39,8 @@ class ResNet18(nn.Module):
         super().__init__()
 
         self.model = nn.Sequential(
-            ResidualBlock(3, 1),
-            ResidualBlock(1, 1),
-            ResidualBlock(1, 1),
-            ResidualBlock(1, 1),
-            ResidualBlock(1, 1),
-            ResidualBlock(1, 1),
-            ResidualBlock(1, 1),
+            ResidualBlock(3, 32),
+            ResidualBlock(32, 32),
         )
 
     def forward(self, x):
@@ -54,7 +49,7 @@ class ResNet18(nn.Module):
 
 class ScalelessViT(nn.Module):
     def __init__(self, n_classes=3, input_dims=(64, 64), latent_size=32, transformer_history_size=8,
-                 n_heads=8, device="cpu"):
+                 n_heads=8, device="cpu", n_channels=1):
         super().__init__()
 
         self.device = device
@@ -63,20 +58,27 @@ class ScalelessViT(nn.Module):
         self.transformer_history_size = transformer_history_size
         self.latent_size = latent_size
 
+        image_size = n_channels
+        for dim in input_dims:
+            image_size *= dim
+
         # Assume pretrained
         self.image_model = nn.Sequential(
             ResNet18(),
             nn.Flatten(),
-            nn.Linear(input_dims[0] * input_dims[1], latent_size)
+            nn.Linear(image_size, latent_size)
         )
 
-        self.transformer_model = Transformer(
-            dim=latent_size, depth=4, heads=transformer_history_size,
-            dim_head=n_heads, mlp_dim=latent_size)
+        encoder_layer = nn.TransformerEncoderLayer(latent_size, nhead=n_heads, dim_feedforward=32)
+        self.transformer_model = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        # self.transformer_model = Transformer(
+        #     dim=latent_size, depth=4, heads=transformer_history_size,
+        #     dim_head=n_heads, mlp_dim=latent_size)
 
-        transformer_latent_size = latent_size * transformer_history_size
+        transformer_latent_size = latent_size * n_heads
         self.classifier_head = nn.Sequential(
             nn.Linear(transformer_latent_size, n_classes),
+            nn.LogSoftmax(),
         )
         self.transformation_head = nn.Sequential(
             nn.Linear(transformer_latent_size, 4),
@@ -85,15 +87,21 @@ class ScalelessViT(nn.Module):
 
         self.profiler = cProfile.Profile()
 
-        self.loss = nn.CrossEntropyLoss()
+        self.loss = nn.NLLLoss()
+
+        # TODO:
+        # Try: Scale loss up to transformer instead of the entire image latent generation part as well
+        # Try: KL divergence loss for the scale loss
+        # Try: Binary classification for scale loss
 
     @staticmethod
+    @cache
     def get_initial_transform(batch_size):
         # Initial transformation is 0, 0 (start in left upper corner) and 1, 1 (use the entire image size)
-        return torch.stack([torch.IntTensor([0, 0, 1, 1]) for i in range(batch_size)])
+        return torch.stack([torch.FloatTensor([0, 0, 1, 1]) for i in range(batch_size)])
 
     def get_initial_history(self, batch_size):
-        return [torch.zeros((batch_size, self.latent_size), device=self.device, requires_grad=True) for _ in
+        return [torch.zeros((batch_size, self.latent_size), device=self.device, requires_grad=False) for _ in
                 range(self.transformer_history_size)]
 
     def compute_loss(self, classification, previous_classes, targets):
@@ -105,16 +113,10 @@ class ScalelessViT(nn.Module):
         # Scale loss subtracts previous prediction from current.
         # If previous prediction on target class was better, it should have higher loss
         # If current prediction is better, loss should be lower
-        # norms = torch.nn.functional.normalize(classification) - torch.nn.functional.normalize(previous_classes)
-        # norms -= torch.min(norms, dim=1)[0][:, None]
-        #
-        # norms = norms / norms.sum(dim=1)[:, None]
+        # norms = norm(classification - previous_classes)
         scale_loss = self.loss(classification - previous_classes, targets) * sl_weight
 
-        # Handle loss (maybe aggregate this over all subsegments)
-        loss = class_loss + scale_loss
-
-        return loss
+        return class_loss, scale_loss
 
     def forward(self, x, history):
         """
@@ -136,18 +138,14 @@ class ScalelessViT(nn.Module):
         # Store latents to use for future iterations
         # History is in format: N, B, D
         # Reformat to B, N, D before using
-        history.append(image_latent)
 
         # We will only train the transformer model, so creating the input starts here
         # The history array is of shape [n, b, l]
         # N is the nth iteration, b is the batch size, and l is the latent size.
 
         # Take the last N samples from history to build transformer input
-        transformer_input = torch.stack(history[-self.transformer_history_size:], dim=1)
-
-        # TODO: Shuffle data correctly
-        transformer_input = torch.reshape(transformer_input.permute((0, 2, 1)),
-                                          (b, self.transformer_history_size, self.latent_size))
+        transformer_input = torch.stack(history[-(self.transformer_history_size - 1):] + [image_latent], dim=1)
+        history.append(image_latent.detach())
 
         transformer_latent = (
             self.transformer_model(transformer_input).reshape(b, self.transformer_history_size * self.latent_size)
@@ -158,9 +156,15 @@ class ScalelessViT(nn.Module):
 
         return class_pred, transform_pred
 
-    @staticmethod
-    def extract_images_with_scales(x: torch.IntTensor, scales: torch.IntTensor,
-                                   dims: torch.IntTensor) -> torch.Tensor:
+    def extract_images_with_scales(self, x: torch.IntTensor, scales: torch.FloatTensor,
+                                   dims: torch.IntTensor) -> torch.IntTensor:
+        import crop_interpolate
+        return crop_interpolate.crop_interpolate(
+            x.to(self.device),
+            scales.to(self.device),
+            dims
+        )
+
         sampled_images = []
         for i in range(len(x)):
             scale = scales[i]
@@ -192,4 +196,4 @@ class ScalelessViT(nn.Module):
             ).squeeze(0)
             sampled_images.append(interpolated)
 
-        return torch.stack(sampled_images)
+        return torch.stack(sampled_images).to(self.device)
