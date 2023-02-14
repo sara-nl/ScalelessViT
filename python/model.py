@@ -1,8 +1,6 @@
 from functools import cache
-from typing import Tuple
-
+import crop_interpolate
 import torch
-import torchvision.transforms.functional_tensor
 from torch import nn
 import cProfile
 
@@ -68,8 +66,7 @@ class ScalelessViT(nn.Module):
             nn.Flatten(),
             nn.Linear(image_size, latent_size)
         )
-
-        encoder_layer = nn.TransformerEncoderLayer(latent_size, nhead=n_heads, dim_feedforward=32)
+        encoder_layer = nn.TransformerEncoderLayer(latent_size, nhead=n_heads, dim_feedforward=128)
         self.transformer_model = nn.TransformerEncoder(encoder_layer, num_layers=2)
         # self.transformer_model = Transformer(
         #     dim=latent_size, depth=4, heads=transformer_history_size,
@@ -78,7 +75,7 @@ class ScalelessViT(nn.Module):
         transformer_latent_size = latent_size * n_heads
         self.classifier_head = nn.Sequential(
             nn.Linear(transformer_latent_size, n_classes),
-            nn.LogSoftmax(),
+            nn.LogSoftmax(dim=-1),
         )
         self.transformation_head = nn.Sequential(
             nn.Linear(transformer_latent_size, 4),
@@ -88,35 +85,84 @@ class ScalelessViT(nn.Module):
         self.profiler = cProfile.Profile()
 
         self.loss = nn.NLLLoss()
+        self.transform_loss = nn.MSELoss()
 
         # TODO:
         # Try: Scale loss up to transformer instead of the entire image latent generation part as well
         # Try: KL divergence loss for the scale loss
         # Try: Binary classification for scale loss
 
-    @staticmethod
     @cache
-    def get_initial_transform(batch_size):
+    def get_initial_transforms(self, batch_size):
+        """
+        Initial transformation to be used for patch extraction.
+        The initial patches should encapsulate the entire image, and take up the entire width and height.
+        The transformation will return a tensor of shape [B, 4] with values [0, 0, 1, 1]
+        These values indicate an X- and Y-offset of 0%, and an X- and Y-width of 100%.
+
+        :param batch_size:
+        :return:
+        """
         # Initial transformation is 0, 0 (start in left upper corner) and 1, 1 (use the entire image size)
-        return torch.stack([torch.FloatTensor([0, 0, 1, 1]) for i in range(batch_size)])
+        initial = torch.stack([torch.FloatTensor([0, 0, 1, 1]) for i in range(batch_size)])
+        zeros = torch.zeros(initial.shape, device=self.device, requires_grad=True)
+        return initial.to(self.device), zeros
 
     def get_initial_history(self, batch_size):
+        """
+        Generate a history list with correctly shaped zero-tensors to be used as padding in the first iterations of the
+         model.
+
+        :param batch_size:
+        :return:
+        """
         return [torch.zeros((batch_size, self.latent_size), device=self.device, requires_grad=False) for _ in
                 range(self.transformer_history_size)]
 
-    def compute_loss(self, classification, previous_classes, targets):
+    def compute_loss(self, classes, p_classes, transformation, p_transform, targets):
+        """
+        Compute two losses for the classification and for the transformation values.
+        The classification loss is simply based on the accuracy on the targets.
+        The transformation loss is computed with a combination of the classification and transformation.
+        We compute the transformation loss relative to p_transform, whereas we compute the classification loss relative
+         to the current classification.
+
+        Transformation loss example in a binary classification task:
+        ```
+        targets     (y) = [1]
+        classes     (c) = [0.6, 0.4]
+        p_classes   (C) = [0.7, 0.3]
+        transform   (t) = [0.1, 0.1, 0.5, 0.5]
+        p_transform (T) = [0.2, 0.2, 0.3, 0.3]
+
+        c - C             = [-0.1, 0.1]
+        s = (c - C)[y]    = [0.1]
+
+        t - T             = [-0.1, -0.1, 0.2, 0.2]
+        d = (t - T) * s   = [-0.01, -0.01, 0.02, 0.02]
+        target = T + d    = [0.19, 0.19, 0.32, 0.32]
+
+        transformation_loss = MSELoss(p_transform, target)
+        ```
+
+        :param classes: current classification
+        :param p_classes: previous classification
+        :param transformation: current transformation
+        :param p_transform: previous transformation
+        :param targets: classification targets
+        :return: classification_loss, transformation_loss
+        """
         # Calculate loss on the classification
-        cl_weight = 0.5  # Class loss weight
-        sl_weight = 0.5  # Scale loss weight, use to balance loss combination
-        class_loss = self.loss(classification, targets) * cl_weight
+        class_loss = self.loss(classes, targets)
 
-        # Scale loss subtracts previous prediction from current.
-        # If previous prediction on target class was better, it should have higher loss
-        # If current prediction is better, loss should be lower
-        # norms = norm(classification - previous_classes)
-        scale_loss = self.loss(classification - previous_classes, targets) * sl_weight
+        # Compute how much better the classification was as a result of the new transformation:
+        # if   p_classes -> classes   went up, the change from   p_transform -> transform   was positive
+        improvement = torch.gather(classes - p_classes, 1, targets.unsqueeze(-1))
+        transform_target = p_transform + ((transformation - p_transform) * improvement)
 
-        return class_loss, scale_loss
+        transform_loss = self.transform_loss(p_transform, transform_target)
+
+        return class_loss, transform_loss
 
     def forward(self, x, history):
         """
@@ -144,7 +190,8 @@ class ScalelessViT(nn.Module):
         # N is the nth iteration, b is the batch size, and l is the latent size.
 
         # Take the last N samples from history to build transformer input
-        transformer_input = torch.stack(history[-(self.transformer_history_size - 1):] + [image_latent], dim=1)
+        transformer_input = torch.stack(history[len(history) - (self.transformer_history_size - 1):] + [image_latent],
+                                        dim=1)
         history.append(image_latent.detach())
 
         transformer_latent = (
@@ -158,42 +205,8 @@ class ScalelessViT(nn.Module):
 
     def extract_images_with_scales(self, x: torch.IntTensor, scales: torch.FloatTensor,
                                    dims: torch.IntTensor) -> torch.IntTensor:
-        import crop_interpolate
         return crop_interpolate.crop_interpolate(
             x.to(self.device),
             scales.to(self.device),
             dims
         )
-
-        sampled_images = []
-        for i in range(len(x)):
-            scale = scales[i]
-            image = x[i]
-
-            # Extract percentage x,y and zoom x,y
-            px, py, zx, zy = [scale[n].item() for n in range(4)]
-            c, w, h = image.shape
-
-            avx = (w - dims[0])  # Available space X
-            avy = (h - dims[1])  # Available space Y
-
-            # Get the selected box starting point as subset of the image.
-            # We now scale the   0,1   range to    0,(size-64)  so we cannot have invalid percentages.
-            x1 = px * avx
-            y1 = py * avy
-
-            # We scale the image to be 64 for zoom=0, and image_size for zoom=1
-            # Clip max size based on available remaining pixels
-            x_size = min(w - x1, (zx * avx) + dims[0])
-            y_size = min(h - y1, (zy * avy) + dims[1])
-
-            cropped = torchvision.transforms.functional_tensor.crop(
-                image, int(x1), int(y1), int(x_size), int(y_size)
-            ).unsqueeze(0)
-            interpolated = torch.nn.functional.interpolate(
-                cropped,
-                dims[0].item(), mode="nearest"
-            ).squeeze(0)
-            sampled_images.append(interpolated)
-
-        return torch.stack(sampled_images).to(self.device)

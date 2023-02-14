@@ -16,10 +16,6 @@ torch::Tensor generate_dummy_transforms(int B, torch::Device dev) {
     return torch::rand({B, 4}, options);
 }
 
-//__global__ void cropInterpolateKernel(const char *images, const char *transforms, long W, long H) {
-//    size_t tid =
-//}
-
 torch::Tensor crop_interpolate_tensor(
         const torch::Tensor &images,
         const torch::Tensor &transforms,
@@ -200,7 +196,7 @@ int main() {
             auto result = crop_interpolate_default(images, transforms, dims);
         } else if (func == 2) {
             auto result = crop_interpolate_parallel(images, transforms, dims);
-        } else if (func == 3) {
+        } else if (func == 3 and dev == 1) {
             auto result = call_ci_kernel(images, transforms, dims);
         }
 

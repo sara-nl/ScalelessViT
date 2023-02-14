@@ -5,6 +5,7 @@ from typing import List
 import numpy as np
 import torch
 from matplotlib import pyplot as plt
+from matplotlib.patches import Rectangle
 from tqdm import tqdm
 
 from model import ScalelessViT
@@ -12,18 +13,32 @@ import torchvision.datasets.mnist
 from torch.utils import data
 
 
-def train(model, train_dataloader, calibration_iters):
+def train(model: ScalelessViT, train_dataloader, calibration_iters=1, logdir="log", **kwargs):
+    """
+    Training loop for the Scaleless model.
+    This training loop keeps track of previous iteration's predictions to use for the loss of the transformation.
+    Transformation loss can only be determined from the difference in classification: (p_{i} - p_{i-1})
+
+    We use two optimizers, one for the entire model without the transformation, and one for the transformation only.
+
+    :param model:
+    :param train_dataloader:
+    :param calibration_iters: amount of subsections of the image to use for prediction
+    :param logdir:
+    :param kwargs:
+    :return:
+    """
+    # Initialize optimizers
     classifier_params = set(model.parameters()) - set(model.transformation_head.parameters())
     transformation_params = set(model.parameters()) - set(model.classifier_head.parameters()) - set(
         model.image_model.parameters())
 
-    class_optimizer = torch.optim.Adam(lr=2e-4, params=classifier_params)
-    transformation_optimizer = torch.optim.Adam(lr=2e-4, params=transformation_params)
+    class_optimizer = torch.optim.Adam(lr=1e-4, params=classifier_params)
+    transformation_optimizer = torch.optim.Adam(lr=1e-4, params=transformation_params)
 
     bar = tqdm(train_dataloader)
     for x, targets in bar:
         targets = targets.to(model.device)
-        # x = x.to(model.device)
         bs = targets.shape[0]
 
         class_optimizer.zero_grad()
@@ -34,40 +49,45 @@ def train(model, train_dataloader, calibration_iters):
 
         # Store previous iteration classification to compute loss on network scale_output
         previous_classes = torch.ones((bs, model.n_classes), device=model.device) / model.n_classes
-        transformation = model.get_initial_transform(bs)
+        transformation, previous_transformation = model.get_initial_transforms(bs)
         start_loss = 0
-        end_loss = 0
         for i in range(calibration_iters):
             # Create image patch from transformation
             images = model.extract_images_with_scales(x, transformation, model.input_dims)
             classification, next_transformation = model(images, history)
 
-            cls_loss, tra_loss = model.compute_loss(classification, previous_classes, targets=targets)
+            cls_loss, tra_loss = model.compute_loss(classes=classification,
+                                                    p_classes=previous_classes,
+                                                    transformation=transformation,
+                                                    p_transform=previous_transformation,
+                                                    targets=targets)
 
             # Apply classification loss to classification part of network
             cls_loss.backward()
             class_optimizer.step()
             class_optimizer.zero_grad()
-
             if i > 0:
                 # Apply transformation loss based on previous iter's transformation.
                 tra_loss.backward(inputs=transformation)
                 transformation_optimizer.step()
                 transformation_optimizer.zero_grad()
+            else:
+                tra_loss = torch.zeros((1))
 
             # Store previous classes to get loss next iteration
-            previous_classes = classification
-            transformation = next_transformation
+            previous_transformation, transformation, previous_classes = (
+                transformation,
+                next_transformation,
+                classification
+            )
 
-            loss = cls_loss.item() + tra_loss.item()
+            loss = (cls_loss.item(), tra_loss.item())
             # Report loss improvement over refinement iterations
             if i == 0:
                 start_loss = loss
             end_loss = loss
-            bar.set_postfix_str(f"Loss: {round(start_loss, 2)} -> {round(end_loss, 2)}")
-
-        # model.profiler.print_stats()
-        # exit(0)
+            bar.set_postfix_str(
+                f"Loss: {round(start_loss[0], 2)},{round(start_loss[1], 2)} -> {round(end_loss[0], 2)},{round(end_loss[1], 2)}")
 
 
 def test(model, test_dataloader, calibration_iters):
@@ -88,12 +108,21 @@ def test(model, test_dataloader, calibration_iters):
 
         # Store previous iteration classification to compute loss on network scale_output
         previous_classes = torch.ones((bs, model.n_classes), device=model.device) / model.n_classes
-        transformation = model.get_initial_transform(bs)
+        transformation, previous_transformation = model.get_initial_transforms(bs)
+        start_loss = 0
         for i in range(calibration_iters):
+            # Create image patch from transformation
             images = model.extract_images_with_scales(x, transformation, model.input_dims)
-            classification, transformation = model(images, history)
+            classification, next_transformation = model(images, history)
 
-            l1, l2 = model.compute_loss(classification, previous_classes, targets=targets)
+            l1, l2 = model.compute_loss(classes=classification,
+                                        p_classes=previous_classes,
+                                        transformation=transformation,
+                                        p_transform=previous_transformation,
+                                        targets=targets)
+
+            if i == 0:
+                l2 = torch.zeros((1))
             loss = l1.item() + l2.item()
 
             # Store previous classes to get loss next iteration
@@ -117,10 +146,12 @@ def show_image_segments(model: ScalelessViT, inp, calibration_iters, image_name=
 
     x = inp.to(model.device)
 
-    print(x.shape)
     # Store previous iteration classification to compute loss on network scale_output
-    transformation = model.get_initial_transform(1)
+    transformation = model.get_initial_transforms(1)
+    old_transformations = []
     for i in range(calibration_iters):
+        old_transformations.append(transformation.detach())
+
         image = model.extract_images_with_scales(x.unsqueeze(0), transformation, model.input_dims)
         arr = image.squeeze(0).detach().cpu().numpy()
 
@@ -128,6 +159,14 @@ def show_image_segments(model: ScalelessViT, inp, calibration_iters, image_name=
 
         plt.imsave(f"{image_name}_{i}.png", np.moveaxis(arr, 0, -1), format="png", vmin=0, vmax=1)
         print(f"[{image_name}] Classification {i}:", torch.argmax(classification).item())
+
+    fig, ax = plt.subplots()
+    for transform in old_transformations:
+        ax.add_patch(Rectangle((1, 1), 2, 6,
+                               edgecolor='pink',
+                               facecolor='blue',
+                               fill=True,
+                               lw=5))
     plt.imsave(f"{image_name}_original.png", inp.moveaxis(0, -1).numpy(), format="png", vmin=0, vmax=1)
 
 
@@ -136,35 +175,57 @@ def parse_args():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--interpolate_size", type=int, default=8)
-    parser.add_argument("--calibration_iters", type=int, default=4)
+    parser.add_argument("--interpolate_size", type=int, default=21)
+    parser.add_argument("--calibration_iters", type=int, default=8)
     parser.add_argument("--inference_filename", type=str, default=None)
+    parser.add_argument("--logdir", type=str, default="logs/")
+    parser.add_argument("--max_samples", type=int, default=-1,
+                        help="Limit the training dataset to N-samples. Can be used for profiling. ")
+    parser.add_argument("--dataset", type=str, default="PCAM",
+                        help="Select the dataset to load, currently only PCAM and MNIST are implemented.")
 
     return parser.parse_args()
+
+
+def get_dataset(name):
+    if name == "PCAM":
+        train_dataset = torchvision.datasets.PCAM(
+            root="datasets/",
+            split="train",
+            download=True,
+            transform=torchvision.transforms.PILToTensor(),
+        )
+        test_dataset = torchvision.datasets.PCAM(
+            root="datasets/",
+            split="test",
+            download=True,
+            transform=torchvision.transforms.PILToTensor(),
+        )
+        return train_dataset, test_dataset, 2
+    elif name == "MNIST":
+        dataset = torchvision.datasets.mnist.MNIST(
+            root="datasets/",
+            download=True,
+            transform=torchvision.transforms.PILToTensor(),
+        )
+        # Split dataset
+        tr = int(len(dataset) * 0.7)
+        te = len(dataset) - tr
+        return *data.random_split(dataset, lengths=(tr, te)), 10
 
 
 def main():
     args = parse_args()
 
-    # dataset = torchvision.datasets.mnist.MNIST(
-    #     root="datasets/",
-    #     download=True,
-    #     transform=torchvision.transforms.ToTensor(),
-    # )
-
-    dataset = torchvision.datasets.PCAM(
-        root="datasets/",
-        download=True,
-        transform=torchvision.transforms.ToTensor(),
-    )
+    train_dataset, test_dataset, n_classes = get_dataset(args.dataset)
 
     model = ScalelessViT(
-        n_classes=2,
+        n_classes=n_classes,
         input_dims=(args.interpolate_size, args.interpolate_size),
         transformer_history_size=args.calibration_iters,
+        n_heads=args.calibration_iters,
         device=args.device,
-        n_channels=dataset[0][0].shape[0],
-        n_heads=args.calibration_iters
+        n_channels=train_dataset[0][0].shape[0],
     )
 
     # Load data and model to device
@@ -174,30 +235,35 @@ def main():
         print("Writing inference images to file")
         model.load_state_dict(torch.load(args.inference_filename))
         for i in range(10):
-            show_image_segments(model, dataset[i][0], args.calibration_iters,
-                                image_name=f"images/im_{i}_{dataset[i][1]}")
+            show_image_segments(model, train_dataset[i][0], args.calibration_iters,
+                                image_name=f"images/im_{i}_{train_dataset[i][1]}")
         exit(0)
 
-    # Split dataset
-    tr = int(len(dataset) * 0.7)
-    te = len(dataset) - tr
-    train_dataset, test_dataset = data.random_split(dataset, lengths=(tr, te))
-
     # Create dataloaders
-    test_dataloader = data.dataloader.DataLoader(test_dataset, batch_size=1024)
-    train_dataloader = data.dataloader.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    train_dataloader = data.dataloader.DataLoader(train_dataset,
+                                                  batch_size=args.batch_size,
+                                                  shuffle=True,
+                                                  num_workers=18,
+                                                  pin_memory=True,
+                                                  persistent_workers=True,
+                                                  prefetch_factor=4)
+    test_dataloader = data.dataloader.DataLoader(test_dataset,
+                                                 batch_size=1024,
+                                                 num_workers=18,
+                                                 pin_memory=True,
+                                                 persistent_workers=True,
+                                                 prefetch_factor=4)
 
     for epoch in range(args.epochs):
         print(f"Epoch {epoch}")
-
-        train(model, train_dataloader, args.calibration_iters)
+        train(model, train_dataloader, **vars(args))
         test(model, test_dataloader, args.calibration_iters)
 
         # Store model
         os.makedirs("checkpoints", exist_ok=True)
         torch.save(model.state_dict(), "checkpoints/model.chkpt")
 
-    show_image_segments(model, dataset[0][0], args.calibration_iters)
+    show_image_segments(model, test_dataset[0][0], args.calibration_iters)
 
 
 if __name__ == "__main__":
