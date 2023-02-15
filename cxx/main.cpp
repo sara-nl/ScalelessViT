@@ -19,9 +19,9 @@ torch::Tensor generate_dummy_transforms(int B, torch::Device dev) {
 torch::Tensor crop_interpolate_tensor(
         const torch::Tensor &images,
         const torch::Tensor &transforms,
-        const torch::DimVector &dims) {
-    auto W = dims[0];
-    auto H = dims[1];
+        const torch::Tensor &dims) {
+    long W = dims[0].item().toLong();
+    long H = dims[1].item().toLong();
 
     // Cropped output images
     auto options = torch::TensorOptions().dtype(torch::kUInt8).device(images.device());
@@ -67,9 +67,9 @@ torch::Tensor crop_interpolate_tensor(
 torch::Tensor crop_interpolate_default(
         const torch::Tensor &images,
         const torch::Tensor &transforms,
-        const torch::DimVector &dims) {
-    long cW = dims[0];
-    long cH = dims[1];
+        const torch::Tensor &dims) {
+    long cW = dims[0].item().toLong();
+    long cH = dims[1].item().toLong();
 
     // Cropped output images
     auto options = torch::TensorOptions().dtype(torch::kUInt8).device(images.device());
@@ -114,9 +114,9 @@ torch::Tensor crop_interpolate_default(
 torch::Tensor crop_interpolate_parallel(
         const torch::Tensor &images,
         const torch::Tensor &transforms,
-        const torch::DimVector &dims) {
-    long cW = dims[0];
-    long cH = dims[1];
+        const torch::Tensor &dims) {
+    long cW = dims[0].item().toLong();
+    long cH = dims[1].item().toLong();
 
     // Cropped output images
     auto options = torch::TensorOptions().dtype(torch::kUInt8).device(images.device());
@@ -165,13 +165,15 @@ torch::Tensor crop_interpolate_parallel(
 int main() {
     int B = 64;
     int C = 1;
-    torch::DimVector dims = {8, 8};
+    auto dims = torch::full({2}, 8);
 
     int n_devices = 2;
     int n_functions = 4;
 
     initialize();
 
+    torch::Tensor base_result;
+    torch::Tensor result;
     for (uint i = 7; i < (n_devices * n_functions); i++) {
         torch::Device device = torch::Device(torch::kCPU);;
         uint dev = i % n_devices;
@@ -185,25 +187,29 @@ int main() {
         // Input images
         torch::Tensor images = generate_dummy_images(B, C, device);
         torch::Tensor transforms = generate_dummy_transforms(B, device);
+        if (i == 0) {
+            base_result = crop_interpolate_tensor(images, transforms, dims);
+        }
 
         using nano = std::chrono::nanoseconds;
         auto start = std::chrono::high_resolution_clock::now();
 
         uint func = i / n_devices;
         if (func == 0) {
-            auto result = crop_interpolate_tensor(images, transforms, dims);
+            result = crop_interpolate_tensor(images, transforms, dims);
         } else if (func == 1) {
-            auto result = crop_interpolate_default(images, transforms, dims);
+            result = crop_interpolate_default(images, transforms, dims);
         } else if (func == 2) {
-            auto result = crop_interpolate_parallel(images, transforms, dims);
+            result = crop_interpolate_parallel(images, transforms, dims);
         } else if (func == 3 and dev == 1) {
-            auto result = call_ci_kernel(images, transforms, dims);
+            result = call_ci_kernel(images, transforms, dims);
         }
-
         auto finish = std::chrono::high_resolution_clock::now();
-        std::cout << "ci" << func << " (" << device << ") took "
+        std::cout << "crop_interpolate_" << func << " (" << device << ") took "
                   << std::chrono::duration_cast<nano>(finish - start).count() / 1.e6
                   << " ms\n";
+
+        std::cout << "reference == kernel: " << torch::equal(result, base_result);
     }
 
 
