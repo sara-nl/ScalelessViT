@@ -71,7 +71,7 @@ torch::Tensor call_ci_kernel(const torch::Tensor &images,
             long(output_dims.w), long(output_dims.h)
     };
     torch::IntArrayRef out_dims_torch(vec);
-    auto options = torch::TensorOptions().dtype(torch::kFloat).device(images.device());
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(images.device());
     auto output_images = torch::zeros(out_dims_torch, options);
 
     // Wait for memory to finish copying
@@ -95,6 +95,6 @@ torch::Tensor call_ci_kernel(const torch::Tensor &images,
     return output_images;
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("crop_interpolate", &call_ci_kernel, "Crop Interpolate");
-}
+//PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+//    m.def("crop_interpolate", &call_ci_kernel, "Crop Interpolate");
+//}

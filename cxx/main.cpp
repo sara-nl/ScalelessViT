@@ -20,11 +20,11 @@ torch::Tensor crop_interpolate_tensor(
         const torch::Tensor &images,
         const torch::Tensor &transforms,
         const torch::Tensor &dims) {
-    long W = dims[0].item().toLong();
-    long H = dims[1].item().toLong();
+    auto W = dims[0].item().toLong();
+    auto H = dims[1].item().toLong();
 
     // Cropped output images
-    auto options = torch::TensorOptions().dtype(torch::kUInt8).device(images.device());
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(images.device());
     auto cropped_images = torch::zeros({images.size(0), images.size(1), W, H}, options);
 
     for (long i = 0; i < images.size(0); i++) {
@@ -55,7 +55,7 @@ torch::Tensor crop_interpolate_tensor(
                 auto sy = (y1 + (y_size / H) * y).toType(torch::kInt32);;
 
                 for (long c = 0; c < channels; c++) {
-                    cropped_images[i][0][x][y] = image[0][sx][sy];
+                    cropped_images[i][c][x][y] = image[c][sx][sy].item().toFloat() / 255;
                 }
             }
         }
@@ -72,7 +72,7 @@ torch::Tensor crop_interpolate_default(
     long cH = dims[1].item().toLong();
 
     // Cropped output images
-    auto options = torch::TensorOptions().dtype(torch::kUInt8).device(images.device());
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(images.device());
     auto cropped_images = torch::zeros({images.size(0), images.size(1), cW, cH}, options);
 
     for (long i = 0; i < images.size(0); i++) {
@@ -103,7 +103,7 @@ torch::Tensor crop_interpolate_default(
                 int sy = int(y1 + (y_size / float(cH)) * float(y));
 
                 for (long c = 0; c < channels; c++) {
-                    cropped_images[i][0][x][y] = image[0][sx][sy];
+                    cropped_images[i][c][x][y] = image[c][sx][sy].item().toFloat() / 255;
                 }
             }
         }
@@ -119,7 +119,7 @@ torch::Tensor crop_interpolate_parallel(
     long cH = dims[1].item().toLong();
 
     // Cropped output images
-    auto options = torch::TensorOptions().dtype(torch::kUInt8).device(images.device());
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(images.device());
     auto cropped_images = torch::zeros({images.size(0), images.size(1), cW, cH}, options);
 
     torch::parallel_for(0, images.size(0), 1, [&](size_t chunk_start, size_t chunk_end) {
@@ -151,7 +151,7 @@ torch::Tensor crop_interpolate_parallel(
                     int sy = int(y1 + (y_size / float(cH)) * float(y));
 
                     for (long c = 0; c < channels; c++) {
-                        cropped_images[i][c][x][y] = image[c][sx][sy];
+                        cropped_images[i][c][x][y] = image[c][sx][sy].item().toFloat() / 255;
                     }
                 }
             }
@@ -165,7 +165,7 @@ torch::Tensor crop_interpolate_parallel(
 int main() {
     int B = 64;
     int C = 1;
-    auto dims = torch::full({2}, 8);
+    torch::Tensor dims = torch::full({2}, 8);
 
     int n_devices = 2;
     int n_functions = 4;
@@ -174,7 +174,7 @@ int main() {
 
     torch::Tensor base_result;
     torch::Tensor result;
-    for (uint i = 7; i < (n_devices * n_functions); i++) {
+    for (uint i = 0; i < (n_devices * n_functions); i++) {
         torch::Device device = torch::Device(torch::kCPU);;
         uint dev = i % n_devices;
         if (dev == 0) {
@@ -187,9 +187,7 @@ int main() {
         // Input images
         torch::Tensor images = generate_dummy_images(B, C, device);
         torch::Tensor transforms = generate_dummy_transforms(B, device);
-        if (i == 0) {
-            base_result = crop_interpolate_tensor(images, transforms, dims);
-        }
+        base_result = crop_interpolate_tensor(images, transforms, dims);
 
         using nano = std::chrono::nanoseconds;
         auto start = std::chrono::high_resolution_clock::now();
@@ -209,7 +207,8 @@ int main() {
                   << std::chrono::duration_cast<nano>(finish - start).count() / 1.e6
                   << " ms\n";
 
-        std::cout << "reference == kernel: " << torch::equal(result, base_result);
+        if (!(func == 3 and dev == 0))
+            std::cout << "reference == kernel: " << torch::equal(result, base_result) << std::endl;
     }
 
 
