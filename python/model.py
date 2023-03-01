@@ -104,7 +104,7 @@ class ScalelessViT(nn.Module):
         :return:
         """
         # Initial transformation is 0, 0 (start in left upper corner) and 1, 1 (use the entire image size)
-        initial = torch.stack([torch.FloatTensor([0, 0, 1, 1]) for i in range(batch_size)])
+        initial = torch.stack([torch.tensor([0, 0, 1, 1], dtype=torch.float32, requires_grad=True) for i in range(batch_size)])
         zeros = torch.zeros(initial.shape, device=self.device, requires_grad=True)
         return initial.to(self.device), zeros
 
@@ -171,10 +171,8 @@ class ScalelessViT(nn.Module):
         Scale is defined as [offset_x, offset_y, scale_x, scale_y]
 
         :param x: Batch of images of any size [b, c, w, h]
-        :param transformation: Batch of scales for each image [b, 4]
         :param history: List of previous transformer latents, the list will get 1 new entry
-        :param return_image:
-        :return:
+        :return: classification prediction, transformation prediction
         """
         b, c, w, h = x.shape
 

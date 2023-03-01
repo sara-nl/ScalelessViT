@@ -13,7 +13,7 @@ import torchvision.datasets.mnist
 from torch.utils import data
 
 
-def train(model: ScalelessViT, train_dataloader, calibration_iters=1, logdir="log", **kwargs):
+def train(model: ScalelessViT, train_dataloader, calibration_iters=1, logdir="log", create_boxplot=False, **kwargs):
     """
     Training loop for the Scaleless model.
     This training loop keeps track of previous iteration's predictions to use for the loss of the transformation.
@@ -33,11 +33,14 @@ def train(model: ScalelessViT, train_dataloader, calibration_iters=1, logdir="lo
     transformation_params = set(model.parameters()) - set(model.classifier_head.parameters()) - set(
         model.image_model.parameters())
 
-    class_optimizer = torch.optim.Adam(lr=1e-4, params=classifier_params)
-    transformation_optimizer = torch.optim.Adam(lr=1e-4, params=transformation_params)
+    class_optimizer = torch.optim.Adam(lr=1e-5, params=classifier_params)
+    transformation_optimizer = torch.optim.Adam(lr=1e-5, params=transformation_params)
+
 
     bar = tqdm(train_dataloader)
     for x, targets in bar:
+        transformations = []
+
         targets = targets.to(model.device)
         bs = targets.shape[0]
 
@@ -52,6 +55,9 @@ def train(model: ScalelessViT, train_dataloader, calibration_iters=1, logdir="lo
         transformation, previous_transformation = model.get_initial_transforms(bs)
         start_loss = 0
         for i in range(calibration_iters):
+            if create_boxplot:
+                transformations.append(transformation)
+
             # Create image patch from transformation
             images = model.extract_images_with_scales(x, transformation, model.input_dims)
             classification, next_transformation = model(images, history)
@@ -68,7 +74,7 @@ def train(model: ScalelessViT, train_dataloader, calibration_iters=1, logdir="lo
             class_optimizer.zero_grad()
             if i > 0:
                 # Apply transformation loss based on previous iter's transformation.
-                tra_loss.backward(inputs=transformation)
+                tra_loss.backward(inputs=previous_transformation)
                 transformation_optimizer.step()
                 transformation_optimizer.zero_grad()
             else:
@@ -89,8 +95,12 @@ def train(model: ScalelessViT, train_dataloader, calibration_iters=1, logdir="lo
             bar.set_postfix_str(
                 f"Loss: {round(start_loss[0], 2)},{round(start_loss[1], 2)} -> {round(end_loss[0], 2)},{round(end_loss[1], 2)}")
 
+        if create_boxplot:
+            transformations = np.array(transformations)
+            print(transformations.shape)
+            # plt.boxplot(transformations.)
 
-def test(model, test_dataloader, calibration_iters):
+def test(model: ScalelessViT, test_dataloader, calibration_iters):
     losses = []
     accs = []
     losses_1s = []
@@ -128,16 +138,17 @@ def test(model, test_dataloader, calibration_iters):
             # Store previous classes to get loss next iteration
             previous_classes = classification
 
-            if i == 0:
-                accs_1s.append(torch.mean((torch.argmax(previous_classes, dim=1) == targets).float()))
-                losses_1s.append(loss)
-
             losses.append(loss)
-        accs.append(torch.mean((torch.argmax(previous_classes, dim=1) == targets).float()))
+            accs.append(torch.mean((torch.argmax(previous_classes, dim=1) == targets).float().to("cpu")))
     model.train()
+
+    losses = np.array(losses).reshape((-1, calibration_iters))
+    accs = np.array(accs).reshape((-1, calibration_iters))
+
+    np.set_printoptions(precision=3)
     print(
-        f"Val loss: {sum(losses[calibration_iters - 1::calibration_iters]) / (len(losses) // calibration_iters)} (1-shot: {sum(losses_1s) / len(losses_1s)})")
-    print(f"Val acc: {sum(accs) / len(accs)} (1-shot: {sum(accs_1s) / len(accs_1s)}")
+        f"Val loss: {losses.mean(axis=0)}")
+    print(f"Val acc: {accs.mean(axis=0)}")
 
 
 def show_image_segments(model: ScalelessViT, inp, calibration_iters, image_name="image"):
@@ -178,6 +189,7 @@ def parse_args():
     parser.add_argument("--interpolate_size", type=int, default=21)
     parser.add_argument("--calibration_iters", type=int, default=8)
     parser.add_argument("--inference_filename", type=str, default=None)
+    parser.add_argument("--output_boxplots", type=bool, default=False)
     parser.add_argument("--logdir", type=str, default="logs/")
     parser.add_argument("--max_samples", type=int, default=-1,
                         help="Limit the training dataset to N-samples. Can be used for profiling. ")
