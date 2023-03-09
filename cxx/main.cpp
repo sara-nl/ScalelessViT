@@ -202,7 +202,7 @@ int main() {
 
     // Input images
     start = std::chrono::high_resolution_clock::now();
-    result = call_ci_kernel(images, transforms, dims);
+    torch::Tensor result = call_ci_kernel(images, transforms, dims);
     finish = std::chrono::high_resolution_clock::now();
 
     /*
