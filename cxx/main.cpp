@@ -167,50 +167,53 @@ int main() {
     int C = 1;
     torch::Tensor dims = torch::full({2}, 8);
 
-    int n_devices = 2;
-    int n_functions = 4;
+    int n_functions = 2;
 
+    /*
+     * Create reference images and input data
+     */
+    auto cpu_device = torch::Device(torch::kCPU);
+
+    torch::Tensor images = generate_dummy_images(B, C, cpu_device);
+    torch::Tensor transforms = generate_dummy_transforms(B, cpu_device);
+
+    auto start = std::chrono::high_resolution_clock::now();
+    torch::Tensor base_result = crop_interpolate_default(images, transforms, dims);
+    auto finish = std::chrono::high_resolution_clock::now();
+
+    /*
+     * Output timing result and validate images are the same.
+     */
+    using nano = std::chrono::nanoseconds;
+    std::cout << "crop_interpolate_default (" << cpu_device << ") took "
+              << std::chrono::duration_cast<nano>(finish - start).count() / 1.e6
+              << " ms\n";
+
+    /*
+     * Initializing the CUDA device occurs before the timing starts, as this is a one-time action.
+     * Counting this as part of the kernel compute time will make it an unfair comparison compared to CPU.
+     */
+    torch::Device device = torch::Device(torch::kCUDA, 0);
     initialize();
 
-    torch::Tensor base_result;
-    torch::Tensor result;
-    for (uint i = 0; i < (n_devices * n_functions); i++) {
-        torch::Device device = torch::Device(torch::kCPU);;
-        uint dev = i % n_devices;
-        if (dev == 0) {
-            device = torch::Device(torch::kCPU);
-        } else {
-            device = torch::Device(torch::kCUDA, 0);
-        }
+    /*
+     * Run kernel
+     */
 
+    // Input images
+    start = std::chrono::high_resolution_clock::now();
+    result = call_ci_kernel(images, transforms, dims);
+    finish = std::chrono::high_resolution_clock::now();
 
-        // Input images
-        torch::Tensor images = generate_dummy_images(B, C, device);
-        torch::Tensor transforms = generate_dummy_transforms(B, device);
-        base_result = crop_interpolate_tensor(images, transforms, dims);
+    /*
+     * Output timing result and validate images are the same.
+     */
+    using nano = std::chrono::nanoseconds;
+    std::cout << "call_ci_kernel (" << device << ") took "
+              << std::chrono::duration_cast<nano>(finish - start).count() / 1.e6
+              << " ms\n";
 
-        using nano = std::chrono::nanoseconds;
-        auto start = std::chrono::high_resolution_clock::now();
-
-        uint func = i / n_devices;
-        if (func == 0) {
-            result = crop_interpolate_tensor(images, transforms, dims);
-        } else if (func == 1) {
-            result = crop_interpolate_default(images, transforms, dims);
-        } else if (func == 2) {
-            result = crop_interpolate_parallel(images, transforms, dims);
-        } else if (func == 3 and dev == 1) {
-            result = call_ci_kernel(images, transforms, dims);
-        }
-        auto finish = std::chrono::high_resolution_clock::now();
-        std::cout << "crop_interpolate_" << func << " (" << device << ") took "
-                  << std::chrono::duration_cast<nano>(finish - start).count() / 1.e6
-                  << " ms\n";
-
-        if (!(func == 3 and dev == 0))
-            std::cout << "reference == kernel: " << torch::equal(result, base_result) << std::endl;
-    }
-
+    std::cout << "reference == kernel: " << torch::equal(result, base_result) << std::endl;
 
     return 0;
 }
