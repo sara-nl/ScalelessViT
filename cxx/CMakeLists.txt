@@ -59,8 +59,8 @@ target_link_libraries(ci_kernels CUDA::cudart_static)
 
 target_link_libraries(crop_interpolate ci_kernels ${TORCH_LIBRARIES} ${PYTHON_LIBRARIES})
 # https://gitlab.kitware.com/cmake/community/-/wikis/doc/cmake/RPATH-handling
-set_target_properties(crop_interpolate PROPERTIES INSTALL_RPATH_USE_LINK_PATH FALSE)
-set_target_properties(crop_interpolate PROPERTIES INSTALL_RPATH "/home/duncank/local")
+#set_target_properties(crop_interpolate PROPERTIES INSTALL_RPATH_USE_LINK_PATH FALSE)
+#set_target_properties(crop_interpolate PROPERTIES INSTALL_RPATH "$CM")
 
 install(TARGETS crop_interpolate
         CONFIGURATIONS Release

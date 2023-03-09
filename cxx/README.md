@@ -7,7 +7,7 @@ source ../env.sh
 
 mkdir build
 cd build
-cmake .. -DCMAKE_INSTALL_DIR=.
+cmake .. -DCMAKE_INSTALL_PREFIX=.
 make
 make install
 ```
