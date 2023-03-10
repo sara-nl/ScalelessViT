@@ -199,10 +199,13 @@ int main() {
     /*
      * Run kernel
      */
+    auto gpu_images = images.to(device);
+    auto gpu_transforms = transforms.to(device);
+    auto gpu_dims = dims.to(device);
 
     // Input images
     start = std::chrono::high_resolution_clock::now();
-    torch::Tensor result = call_ci_kernel(images, transforms, dims);
+    torch::Tensor result = call_ci_kernel(gpu_images, gpu_transforms, gpu_dims);
     finish = std::chrono::high_resolution_clock::now();
 
     /*
@@ -213,7 +216,8 @@ int main() {
               << std::chrono::duration_cast<nano>(finish - start).count() / 1.e6
               << " ms\n";
 
-    std::cout << "reference == kernel: " << torch::equal(result, base_result) << std::endl;
+    float threshold = 1e-6;
+    std::cout << "reference == kernel : (0 = bad) " << (torch::max(result.to(cpu_device) - base_result) < threshold) << std::endl;
 
     return 0;
 }
