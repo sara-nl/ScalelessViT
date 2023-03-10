@@ -217,7 +217,7 @@ int main() {
               << " ms\n";
 
     float threshold = 1e-6;
-    std::cout << "reference == kernel : (0 = bad) " << (torch::max(result.to(cpu_device) - base_result) < threshold) << std::endl;
+    std::cout << "reference == kernel : (0 = bad) " << (torch::max(torch::abs(result.to(cpu_device) - base_result)) < threshold) << std::endl;
 
     return 0;
 }
