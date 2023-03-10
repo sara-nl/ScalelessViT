@@ -16,53 +16,6 @@ torch::Tensor generate_dummy_transforms(int B, torch::Device dev) {
     return torch::rand({B, 4}, options);
 }
 
-torch::Tensor crop_interpolate_tensor(
-        const torch::Tensor &images,
-        const torch::Tensor &transforms,
-        const torch::Tensor &dims) {
-    auto W = dims[0].item().toLong();
-    auto H = dims[1].item().toLong();
-
-    // Cropped output images
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(images.device());
-    auto cropped_images = torch::zeros({images.size(0), images.size(1), W, H}, options);
-
-    for (long i = 0; i < images.size(0); i++) {
-        const torch::Tensor &image = images[i];
-        const torch::Tensor &transform = transforms[i];
-
-        // Get current image dimensions
-        auto channels = image.size(0);
-        auto w = image.size(1);
-        auto h = image.size(2);
-
-        auto avx = float(w - W);  // Available space X
-        auto avy = float(h - H);  // Available space Y
-
-        // Get the selected box starting point as subset of the image.
-        // We now scale the   0,1   range to    0,(size-64)  so we cannot have invalid percentages.
-        auto x1 = transform[0] * avx;
-        auto y1 = transform[1] * avy;
-
-        // We scale the image to be 64 for zoom=0, and image_size for zoom=1
-        // Clip max size based on available remaining pixels
-        auto x_size = torch::min(w - x1, (transform[2] * avx) + W);
-        auto y_size = torch::min(h - y1, (transform[3] * avy) + H);
-
-        for (long x = 0; x < W; x++) {
-            for (long y = 0; y < H; y++) {
-                auto sx = (x1 + (x_size / W) * x).toType(torch::kInt32);
-                auto sy = (y1 + (y_size / H) * y).toType(torch::kInt32);;
-
-                for (long c = 0; c < channels; c++) {
-                    cropped_images[i][c][x][y] = image[c][sx][sy].item().toFloat() / 255;
-                }
-            }
-        }
-    }
-
-    return cropped_images;
-}
 
 torch::Tensor crop_interpolate_default(
         const torch::Tensor &images,
@@ -111,63 +64,12 @@ torch::Tensor crop_interpolate_default(
     return cropped_images;
 }
 
-torch::Tensor crop_interpolate_parallel(
-        const torch::Tensor &images,
-        const torch::Tensor &transforms,
-        const torch::Tensor &dims) {
-    long cW = dims[0].item().toLong();
-    long cH = dims[1].item().toLong();
-
-    // Cropped output images
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(images.device());
-    auto cropped_images = torch::zeros({images.size(0), images.size(1), cW, cH}, options);
-
-    torch::parallel_for(0, images.size(0), 1, [&](size_t chunk_start, size_t chunk_end) {
-        for (long i = chunk_start; i < chunk_end; i++) {
-            const torch::Tensor &image = images[i];
-            const torch::Tensor &transform = transforms[i];
-
-            // Get current image dimensions
-            size_t channels = image.size(0);
-            size_t w = image.size(1);
-            size_t h = image.size(2);
-
-            auto avx = float(w - cW);  // Available space X
-            auto avy = float(h - cH);  // Available space Y
-
-            // Get the selected box starting point as subset of the image.
-            // We now scale the   0,1   range to    0,(size-64)  so we cannot have invalid percentages.
-            float x1 = transform[0].item().toFloat() * avx;
-            float y1 = transform[1].item().toFloat() * avy;
-
-            // We scale the image to be 64 for zoom=0, and image_size for zoom=1
-            // Clip max size based on available remaining pixels
-            float x_size = std::fmin(float(w) - x1, (transform[2].item().toFloat() * avx) + float(cW));
-            float y_size = std::fmin(float(h) - y1, (transform[3].item().toFloat() * avy) + float(cH));
-
-            for (long y = 0; y < cH; y++) {
-                for (long x = 0; x < cW; x++) {
-                    int sx = int(x1 + (x_size / float(cW)) * float(x));
-                    int sy = int(y1 + (y_size / float(cH)) * float(y));
-
-                    for (long c = 0; c < channels; c++) {
-                        cropped_images[i][c][x][y] = image[c][sx][sy].item().toFloat() / 255;
-                    }
-                }
-            }
-        }
-    });
-
-    return cropped_images;
-}
-
-
 int main() {
     int B = 64;
-    int C = 1;
-    torch::Tensor dims = torch::full({2}, 8);
+    int C = 3;
 
-    int n_functions = 2;
+    auto options = torch::TensorOptions().dtype(torch::kLong);
+    torch::Tensor dims = torch::full({2}, 8, options);
 
     /*
      * Create reference images and input data
@@ -199,11 +101,16 @@ int main() {
     /*
      * Run kernel
      */
+    auto gpu_images = images.to(device);
+    auto gpu_transforms = transforms.to(device);
+    auto gpu_dims = dims.to(device);
 
     // Input images
     start = std::chrono::high_resolution_clock::now();
-    torch::Tensor result = call_ci_kernel(images, transforms, dims);
+    torch::Tensor result = call_ci_kernel(gpu_images, gpu_transforms, gpu_dims);
     finish = std::chrono::high_resolution_clock::now();
+
+    std::cout << result.to(cpu_device) - base_result << std::endl;
 
     /*
      * Output timing result and validate images are the same.
@@ -213,7 +120,8 @@ int main() {
               << std::chrono::duration_cast<nano>(finish - start).count() / 1.e6
               << " ms\n";
 
-    std::cout << "reference == kernel: " << torch::equal(result, base_result) << std::endl;
+    float threshold = 1e-6;
+    std::cout << "reference == kernel : (0 = bad) " << (torch::max(result.to(cpu_device) - base_result) < threshold) << std::endl;
 
     return 0;
 }
