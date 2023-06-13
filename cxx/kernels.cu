@@ -127,6 +127,6 @@ torch::Tensor call_ci_kernel(const torch::Tensor &images,
     return output_images;
 }
 
-//PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-//    m.def("crop_interpolate", &call_ci_kernel, "Crop Interpolate");
-//}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+   m.def("crop_interpolate", &call_ci_kernel, "Crop Interpolate");
+}
