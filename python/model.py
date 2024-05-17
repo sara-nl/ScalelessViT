@@ -46,40 +46,37 @@ class ResNet18(nn.Module):
 
 
 class ScalelessViT(nn.Module):
-    def __init__(self, n_classes=3, input_dims=(64, 64), latent_size=32, transformer_history_size=8,
+    def __init__(self, n_classes=3, input_dims=(64, 64), latent_size=32, history_size=8,
                  n_heads=8, device="cpu", n_channels=1):
         super().__init__()
 
         self.device = device
         self.n_classes = n_classes
         self.input_dims: torch.IntTensor = torch.IntTensor(input_dims)
-        self.transformer_history_size = transformer_history_size
+        self.history_size = history_size
         self.latent_size = latent_size
 
         image_size = n_channels
         for dim in input_dims:
             image_size *= dim
 
-        # Assume pretrained
-        self.image_model = nn.Sequential(
-            ResNet18(),
+        self.convolutional_model = nn.Sequential(
+            nn.Conv2d(self.history_size, 8, 1),
+            nn.MaxPool2d(2),
+            nn.ReLU(),
+            nn.Conv2d(8, 4, 1),
+            nn.ReLU(),
+            nn.Conv2d(4, 1, 1),
             nn.Flatten(),
-            nn.Linear(image_size, latent_size)
         )
-        encoder_layer = nn.TransformerEncoderLayer(latent_size, nhead=n_heads, dim_feedforward=128)
-        self.transformer_model = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        # self.transformer_model = Transformer(
-        #     dim=latent_size, depth=4, heads=transformer_history_size,
-        #     dim_head=n_heads, mlp_dim=latent_size)
 
-        transformer_latent_size = latent_size * n_heads
+        transformer_latent_size = 16
         self.classifier_head = nn.Sequential(
             nn.Linear(transformer_latent_size, n_classes),
             nn.LogSoftmax(dim=-1),
         )
         self.transformation_head = nn.Sequential(
             nn.Linear(transformer_latent_size, 4),
-            nn.Sigmoid()
         )
 
         self.profiler = cProfile.Profile()
@@ -104,7 +101,8 @@ class ScalelessViT(nn.Module):
         :return:
         """
         # Initial transformation is 0, 0 (start in left upper corner) and 1, 1 (use the entire image size)
-        initial = torch.stack([torch.tensor([0, 0, 1, 1], dtype=torch.float32, requires_grad=True) for i in range(batch_size)])
+        initial = torch.stack(
+            [torch.tensor([0, 0, 1, 1], dtype=torch.float32, requires_grad=True) for i in range(batch_size)])
         zeros = torch.zeros(initial.shape, device=self.device, requires_grad=True)
         return initial.to(self.device), zeros
 
@@ -116,8 +114,8 @@ class ScalelessViT(nn.Module):
         :param batch_size:
         :return:
         """
-        return [torch.zeros((batch_size, self.latent_size), device=self.device, requires_grad=False) for _ in
-                range(self.transformer_history_size)]
+        return [torch.zeros((batch_size, self.input_dims[0], self.input_dims[1]), device=self.device, requires_grad=False) for _ in
+                range(self.history_size)]
 
     def compute_loss(self, classes, p_classes, transformation, p_transform, targets):
         """
@@ -174,31 +172,18 @@ class ScalelessViT(nn.Module):
         :param history: List of previous transformer latents, the list will get 1 new entry
         :return: classification prediction, transformation prediction
         """
-        b, c, w, h = x.shape
-
-        # Assume a pretrained image model exists.
-        image_latent = self.image_model(x)
-
-        # Store latents to use for future iterations
-        # History is in format: N, B, D
-        # Reformat to B, N, D before using
-
-        # We will only train the transformer model, so creating the input starts here
-        # The history array is of shape [n, b, l]
-        # N is the nth iteration, b is the batch size, and l is the latent size.
-
+        history.append(x.squeeze().detach())
         # Take the last N samples from history to build transformer input
-        transformer_input = torch.stack(history[len(history) - (self.transformer_history_size - 1):] + [image_latent],
-                                        dim=1)
-        history.append(image_latent.detach())
+        stacked_input = torch.stack(list(reversed(history[-self.history_size:])), dim=1)
 
-        transformer_latent = (
-            self.transformer_model(transformer_input).reshape(b, self.transformer_history_size * self.latent_size)
-        )
+        class_pred, transform_pred = self.moielijk(stacked_input)
 
-        class_pred = self.classifier_head(transformer_latent)
-        transform_pred = self.transformation_head(transformer_latent)
+        return class_pred, transform_pred
 
+    def moielijk(self, stacked_input):
+        conv_output = self.convolutional_model(stacked_input)
+        class_pred = self.classifier_head(conv_output)
+        transform_pred = torch.clip(self.transformation_head(conv_output), 0, 1)
         return class_pred, transform_pred
 
     def extract_images_with_scales(self, x: torch.IntTensor, scales: torch.FloatTensor,
