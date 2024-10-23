@@ -36,6 +36,10 @@ __global__ void crop_interpolate_kernel(uchar *images, struct dims in_dims, floa
     size_t sub_x = threadIdx.x;
     size_t sub_y = threadIdx.y;
 
+    if (batch_id >= in_dims.b) {
+        return;
+    }
+
     float *transform = &transforms[batch_id * 4];
     size_t image_size = in_dims.w * in_dims.h * in_dims.c;
     uchar *image = &images[batch_id * image_size];
@@ -47,11 +51,11 @@ __global__ void crop_interpolate_kernel(uchar *images, struct dims in_dims, floa
     auto avy = float(in_dims.h - out_dims.h);  // Available space Y
 
     // Get the selected box starting point as subset of the image.
-    // We now scale the   0,1   range to    0,(size-64)  so we cannot have invalid percentages.
+    // We now scale the   0,1   range to    0,(size-out_size)  so we cannot have invalid percentages.
     auto x1 = transform[0] * avx;
     auto y1 = transform[1] * avy;
 
-    // We scale the image to be 64 for zoom=0, and image_size for zoom=1
+    // We scale the image to be out_size for zoom=0, and image_size for zoom=1
     // Clip max size based on available remaining pixels
     auto x_size = min(in_dims.w - x1, (transform[2] * avx) + out_dims.w);
     auto y_size = min(in_dims.h - y1, (transform[3] * avy) + out_dims.h);
@@ -59,16 +63,17 @@ __global__ void crop_interpolate_kernel(uchar *images, struct dims in_dims, floa
     // Iterate x chunks if the output image size is larger than allowed block size.
     for (uint offset_x = 0; offset_x < out_dims.w; offset_x += blockDim.x) {
         int x = sub_x + offset_x;
-        if (x >= out_dims.w) return;
+        if (x >= out_dims.w) continue;
 
-        int sx = int(x1 + (x_size / out_dims.w) * x);
+        int sx = min(int(x1 + (x_size / out_dims.w) * x), int(in_dims.w - 1));
         for (uint offset_y = 0; offset_y < out_dims.h; offset_y += blockDim.y) {
             int y = sub_y + offset_y;
-            if (y >= out_dims.h) return;
+            if (y >= out_dims.h) continue;
 
-            int sy = int(y1 + (y_size / out_dims.h) * y);
+            int sy = min(int(y1 + (y_size / out_dims.h) * y), int(in_dims.h - 1));
+//            printf("%d %d", sx, sy);
             for (long c = 0; c < out_dims.c; c++) {
-                output_image[(c * out_dims.w + y) * out_dims.h + x] = image[(c * in_dims.w + sy) * in_dims.h + sx];
+                output_image[(c * out_dims.h + y) * out_dims.w + x] = image[(c * in_dims.h + sy) * in_dims.w + sx];
             }
         }
     }
@@ -122,12 +127,7 @@ torch::Tensor call_ci_kernel(const torch::Tensor &images,
     /*
      * Process kernel
      */
-    dim3 blocks;
-    if (output_dims.w * output_dims.h < 1024) {
-        blocks = {uint(output_dims.w), uint(output_dims.h)};
-    } else {
-        blocks = {32, 32};
-    }
+    dim3 blocks = {32, 32};
     dim3 grids = {uint(input_dims.b)};
 
     crop_interpolate_kernel<<<grids, blocks>>>(
