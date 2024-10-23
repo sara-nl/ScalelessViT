@@ -28,24 +28,7 @@ class ResidualBlock(nn.Module):
         return self.in_channels != self.out_channels
 
 
-class ResNet18(nn.Module):
-    """
-    Doe maar hierin thomas
-    """
-
-    def __init__(self):
-        super().__init__()
-
-        self.model = nn.Sequential(
-            ResidualBlock(3, 32),
-            ResidualBlock(32, 32),
-        )
-
-    def forward(self, x):
-        return self.model(x)
-
-
-class ScalelessViT(nn.Module):
+class SegmentSelectionModel(nn.Module):
     def __init__(self, n_classes=3, input_dims=(64, 64), latent_size=32, history_size=8,
                  n_heads=8, device="cpu", n_channels=1):
         super().__init__()
@@ -187,7 +170,7 @@ class ScalelessViT(nn.Module):
         return class_pred, transform_pred
 
     def extract_images_with_scales(self, x: torch.IntTensor, scales: torch.FloatTensor,
-                                   dims: torch.IntTensor) -> torch.IntTensor:
+                                   dims: torch.IntTensor) -> torch.FloatTensor:
         return crop_interpolate.crop_interpolate(
             x.to(self.device),
             scales.to(self.device),
